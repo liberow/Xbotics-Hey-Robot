@@ -3,9 +3,8 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-from dataclasses import dataclass
-from types import SimpleNamespace
-from typing import Any, Protocol
+from dataclasses import dataclass, replace
+from typing import Any
 
 from hey_robot.bus.factory import create_bus_client
 from hey_robot.capability.runtime import (
@@ -19,8 +18,6 @@ from hey_robot.events.bus import BusEventPublisher
 from hey_robot.human_follow import HumanFollowServiceClient
 from hey_robot.logging import HeyRobotLogger
 from hey_robot.media import LocalMediaStore, MediaResolver
-from hey_robot.perception import CodecRegistry, ObservationActionCodec
-from hey_robot.policies.runtime import PolicyRuntime, build_policy_runtime
 from hey_robot.protocol import (
     RobotObservation,
     RobotStatus,
@@ -43,22 +40,14 @@ from hey_robot.skills.scheduler import SkillRun, SkillScheduler
 logger = HeyRobotLogger(name="skill")
 
 
-class SkillPolicyRuntime(Protocol):
-    @property
-    def control_period_sec(self) -> float: ...
-
-    async def close(self) -> None: ...
-
-
 @dataclass
 class _SkillControllerState:
     spec: PolicySpec
-    codec: ObservationActionCodec
     scheduler: SkillScheduler
     latest_observation: RobotObservation | None = None
     latest_status: RobotStatus | None = None
-    runtime: SkillPolicyRuntime | None = None
     last_scheduler_decision: dict[str, Any] | None = None
+    recently_finished_runs: dict[str, tuple[SkillRun, float, str | None]] | None = None
 
     @property
     def active_runs(self) -> dict[str, SkillRun]:
@@ -66,13 +55,11 @@ class _SkillControllerState:
 
 
 class SkillControllerService:
-    def __init__(self, config: DeploymentConfig, *, robot_service: Any = None) -> None:
+    def __init__(self, config: DeploymentConfig) -> None:
         self.config = config
-        self._robot_service = robot_service
         self.topics = Topics()
         self.bus = create_bus_client(config.deployment.bus)
         self.events = BusEventPublisher(self.bus, self.topics)
-        self.codecs = CodecRegistry()
         self.media_resolver = MediaResolver(
             LocalMediaStore(
                 config.resources.media_root, max_items=config.resources.media_max_items
@@ -93,7 +80,6 @@ class SkillControllerService:
         self.states = {
             policy_id: _SkillControllerState(
                 spec=spec,
-                codec=self.codecs.get(str(spec.settings.get("codec", spec.type))),
                 scheduler=SkillScheduler(self.contracts),
             )
             for policy_id, spec in config.policies.items()
@@ -109,28 +95,9 @@ class SkillControllerService:
         )
 
     async def start(self) -> None:
-        if self._robot_service is not None:
-            for service_id, svc_spec in self.config.capability_services.items():
-                if svc_spec.type != "vla_service" or not svc_spec.enabled:
-                    continue
-                robot_id = svc_spec.robot_id
-                if not robot_id:
-                    continue
-                driver = self._robot_service.get(robot_id)
-                if driver is None:
-                    continue
-                io = driver.create_vla_io_adapter(**svc_spec.settings)
-                if io is not None:
-                    self.capabilities.set_vla_io_adapter(io)
-                    logger.info(
-                        f"VLA I/O adapter injected service={service_id} robot={robot_id}"
-                    )
-                    break
         await self.bus.connect()
         if self.human_follow is not None:
             await self.human_follow.start()
-        for policy_id, state in self.states.items():
-            state.runtime = self._load_policy_runtime(policy_id, state)
         await self.bus.subscribe([self.topics.robot_observation], self._on_observation)
         await self.bus.subscribe([self.topics.skill_intent], self._on_skill_intent)
         await self.bus.subscribe([self.topics.robot_status], self._on_status)
@@ -143,15 +110,10 @@ class SkillControllerService:
 
     async def stop(self) -> None:
         self._stop.set()
-        tasks = []
         for state in self.states.values():
-            if state.runtime is not None:
-                tasks.append(state.runtime.close())
             for run in state.active_runs.values():
                 if run.task is not None:
                     run.task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
         await self.bus.close()
 
     async def _on_observation(self, _topic: str, payload: dict[str, Any]) -> None:
@@ -167,7 +129,7 @@ class SkillControllerService:
             return
         policy_id, state = state_item
         if intent.interrupt:
-            await self._interrupt_active(policy_id, state, intent)
+            await self._handle_interrupting_intent(policy_id, state, intent)
             return
         try:
             await self._accept_skill(policy_id, state, intent)
@@ -331,6 +293,10 @@ class SkillControllerService:
                 )
             run = state.active_runs.get(status.skill_id or "")
             if run is None or run.terminal:
+                if status.skill_id and status.success is True:
+                    handled = await self._handle_late_success_status(state, status)
+                    if handled:
+                        continue
                 if status.skill_id:
                     logger.warning(
                         "skill_status_trace ignored "
@@ -338,6 +304,7 @@ class SkillControllerService:
                         f"reason={'missing_run' if run is None else 'terminal_run'}"
                     )
                 continue
+            run.status_received_at = time.time()
             future = run.pending_status
             if future is not None and not future.done():
                 logger.info(
@@ -389,9 +356,7 @@ class SkillControllerService:
         await asyncio.sleep(0)
 
     async def _skill_loop(self, policy_id: str, state: _SkillControllerState) -> None:
-        runtime = state.runtime or self._load_policy_runtime(policy_id, state)
-        state.runtime = runtime
-        period = getattr(runtime, "control_period_sec", 0.05)
+        period = 1.0 / max(float(state.spec.freq_hz), 0.1)
         while not self._stop.is_set():
             await self._skill_loop_step(policy_id, state)
             await asyncio.sleep(period)
@@ -489,6 +454,7 @@ class SkillControllerService:
         final_summary = self._completion_summary(run, summary) if success else summary
         run.terminal = True
         state.scheduler.remove(intent.skill_id)
+        self._remember_finished_run(state, run, failure_mode)
         phase = "completed" if success else "failed"
         await self._publish_event(
             intent,
@@ -528,6 +494,87 @@ class SkillControllerService:
             },
             severity="info" if success else "warn",
         )
+
+    def _remember_finished_run(
+        self,
+        state: _SkillControllerState,
+        run: SkillRun,
+        failure_mode: str | None,
+    ) -> None:
+        if state.recently_finished_runs is None:
+            state.recently_finished_runs = {}
+        now = time.time()
+        state.recently_finished_runs[run.intent.skill_id] = (run, now, failure_mode)
+        for skill_id, (_run, finished_at, _failure_mode) in list(
+            state.recently_finished_runs.items()
+        ):
+            if now - finished_at > 5.0:
+                state.recently_finished_runs.pop(skill_id, None)
+
+    async def _handle_late_success_status(
+        self, state: _SkillControllerState, status: RobotStatus
+    ) -> bool:
+        if state.recently_finished_runs is None or not status.skill_id:
+            return False
+        item = state.recently_finished_runs.get(status.skill_id)
+        if item is None:
+            return False
+        run, finished_at, failure_mode = item
+        if failure_mode != "timeout" or time.time() - finished_at > 2.0:
+            return False
+        run.terminal = True
+        run.status_received_at = time.time()
+        run.steps_executed = max(run.steps_executed, 1)
+        step_summary = self._status_step_summary(status)
+        if step_summary:
+            run.step_summaries.append(step_summary)
+        logger.warning(
+            "skill_status_trace late_success_after_timeout "
+            f"robot={status.envelope.robot_id} skill_id={status.skill_id} "
+            f"frame={status.frame_id}"
+        )
+        policy_id = next(
+            policy_id
+            for policy_id, item_state in self.states.items()
+            if item_state is state
+        )
+        await self._publish_event(
+            run.intent,
+            "completed",
+            progress=1.0,
+            summary=step_summary or "late success after timeout",
+            policy_id=policy_id,
+            frame_id=status.frame_id,
+            steps_executed=run.steps_executed,
+            contract=run.contract,
+            execution_plan=run.execution_plan,
+            metadata={"late_success_after_timeout": True},
+        )
+        await self._publish_result(
+            run.intent,
+            "completed",
+            True,
+            step_summary or "late success after timeout",
+            frame_id=status.frame_id,
+            steps_executed=run.steps_executed,
+            contract=run.contract,
+            run=run,
+        )
+        await self._publish_scheduler_state(
+            policy_id,
+            state,
+            phase="completed",
+            intent=run.intent,
+            contract=run.contract,
+            decision={
+                "reason": "late_success_after_timeout",
+                "previous_failure_mode": failure_mode,
+                "error": None,
+            },
+            severity="info",
+        )
+        state.recently_finished_runs.pop(status.skill_id, None)
+        return True
 
     async def _invoke_robot_skill(
         self,
@@ -572,14 +619,6 @@ class SkillControllerService:
             notes=("Recorded from actual skill execution.",),
         )
         action = skill_action.to_robot_action(action_intent)
-        predictor = getattr(state.runtime, "predict", None)
-        if callable(predictor):
-            await predictor(
-                SimpleNamespace(
-                    observation=state.latest_observation,
-                    intent=action_intent,
-                )
-            )
         future: asyncio.Future[RobotStatus] = asyncio.get_running_loop().create_future()
         run.pending_status = future
         run.current_step = name
@@ -590,6 +629,7 @@ class SkillControllerService:
             f"age_sec={max(0.0, time.time() - run.accepted_at):.3f}"
         )
         await self.bus.publish(self.topics.robot_action, to_payload(action))
+        run.action_published_at = time.time()
         await self.events.publish(
             RuntimeEvent.make(
                 EventKind.POLICY_ACTION,
@@ -698,17 +738,6 @@ class SkillControllerService:
                 failure_mode="timeout",
                 error="skill timed out",
             )
-
-    def _load_policy_runtime(
-        self, policy_id: str, state: _SkillControllerState
-    ) -> PolicyRuntime:
-        return build_policy_runtime(
-            policy_id,
-            state.spec,
-            config=self.config,
-            codec=state.codec,
-            media_resolver=self.media_resolver,
-        )
 
     async def _publish_event(
         self,
@@ -960,13 +989,47 @@ class SkillControllerService:
             return max(1.0, duration_ms / 1000.0 + 1.0)
         return 0.0
 
-    async def _interrupt_active(
+    async def _handle_interrupting_intent(
+        self, policy_id: str, state: _SkillControllerState, intent: SkillIntent
+    ) -> None:
+        if intent.name == "interrupt":
+            stop_contract = self.plugin_skill_catalog.resolve(
+                "stop_motion",
+                robot_type=self._robot_type(state.spec.robot_id),
+            )
+        else:
+            self.plugin_skill_catalog.resolve(
+                intent.name,
+                robot_type=self._robot_type(state.spec.robot_id),
+            )
+            stop_contract = None
+        await self._interrupt_active_runs(policy_id, state, intent)
+        if intent.name == "interrupt":
+            assert stop_contract is not None
+            await self._accept_skill(
+                policy_id,
+                state,
+                SkillIntent(
+                    envelope=intent.envelope,
+                    skill_id=intent.skill_id,
+                    name="stop_motion",
+                    arguments={"emergency": True},
+                    objective=intent.objective or "interrupt active skill",
+                    interrupt=False,
+                    timeout_sec=stop_contract.timeout_sec,
+                    feedback_mode=stop_contract.feedback_mode,
+                    metadata={
+                        **dict(intent.metadata),
+                        "source": "skill_controller.interrupt",
+                    },
+                ),
+            )
+            return
+        await self._accept_skill(policy_id, state, replace(intent, interrupt=False))
+
+    async def _interrupt_active_runs(
         self, policy_id: str, state: _SkillControllerState, interrupt: SkillIntent
     ) -> None:
-        self.plugin_skill_catalog.resolve(
-            "stop_motion",
-            robot_type=self._robot_type(state.spec.robot_id),
-        )
         active_runs = [run for run in state.active_runs.values() if not run.terminal]
         for run in active_runs:
             run.terminal = True
@@ -1005,21 +1068,11 @@ class SkillControllerService:
                 },
                 severity="warn",
             )
-        stop_intent = SkillIntent(
-            envelope=interrupt.envelope,
-            skill_id=interrupt.skill_id,
-            name="stop_motion",
-            arguments={"emergency": True},
-            objective=interrupt.objective or "interrupt active skill",
-            interrupt=False,
-            timeout_sec=3.0,
-            feedback_mode="none",
-            metadata={
-                **dict(interrupt.metadata),
-                "source": "skill_controller.interrupt",
-            },
-        )
-        await self._accept_skill(policy_id, state, stop_intent)
+
+    async def _interrupt_active(
+        self, policy_id: str, state: _SkillControllerState, interrupt: SkillIntent
+    ) -> None:
+        await self._handle_interrupting_intent(policy_id, state, interrupt)
 
     @staticmethod
     def _precondition_block(

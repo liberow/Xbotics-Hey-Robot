@@ -46,6 +46,52 @@ class AgentRunRecorder:
             },
         )
 
+    def record_task_contract(self, contract: dict[str, Any]) -> None:
+        self._append_jsonl(
+            "task_contracts.jsonl",
+            {
+                "timestamp": time.time(),
+                "contract": contract,
+            },
+        )
+
+    def record_task_evidence(self, ledger: dict[str, Any]) -> None:
+        self._append_jsonl(
+            "task_evidence.jsonl",
+            {
+                "timestamp": time.time(),
+                "ledger": ledger,
+            },
+        )
+
+    def record_task_evaluation(
+        self,
+        *,
+        contract: dict[str, Any],
+        ledger: dict[str, Any],
+        evaluation: dict[str, Any],
+        final_candidate: str | None = None,
+    ) -> None:
+        self._append_jsonl(
+            "task_evaluations.jsonl",
+            {
+                "timestamp": time.time(),
+                "contract": contract,
+                "ledger": ledger,
+                "evaluation": evaluation,
+                "final_candidate": final_candidate,
+            },
+        )
+
+    def record_turn_trace(self, trace: dict[str, Any]) -> None:
+        self._append_jsonl(
+            "turn_traces.jsonl",
+            {
+                "timestamp": time.time(),
+                "trace": trace,
+            },
+        )
+
     def _append_jsonl(self, filename: str, payload: dict[str, Any]) -> None:
         self.agent_run_dir.mkdir(parents=True, exist_ok=True)
         path = self.agent_run_dir / filename

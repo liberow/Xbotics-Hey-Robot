@@ -31,6 +31,7 @@ from hey_robot.protocol import (
     UserTurn,
 )
 from hey_robot.protocol.messages import from_payload, to_payload
+from hey_robot.user_reply import present_tool_result_for_user
 
 logger = HeyRobotLogger(name="agent")
 
@@ -370,7 +371,7 @@ class RobotAgentService:
             result=result,
             baseline_frame_id=prepared.baseline_frame_id,
         )
-        if result.reply_text:
+        if result.reply_text and not _suppress_user_visible_reply(result):
             await self.publish_reply(
                 AgentReply(
                     envelope=prepared.turn.envelope,
@@ -517,15 +518,22 @@ class RobotAgentService:
                 },
             )
         except Exception as exc:
+            result_text = str(exc)
+            reply_text = present_tool_result_for_user(
+                tool="request_capability",
+                args=args,
+                result=result_text,
+                success=False,
+            ) or _confirmed_capability_failure_reply(capability)
             result = AgentCoreResult(
-                reply_text=_confirmed_capability_failure_reply(capability),
+                reply_text=reply_text,
                 skill_submitted=False,
-                task_finished=True,
+                task_finished=False,
                 tool="request_capability",
                 metadata={
                     "tool": "request_capability",
                     "args": args,
-                    "result": str(exc),
+                    "result": result_text,
                     "skill_id": None,
                     "stop_reason": "confirmed_capability_failed",
                     "confirmed_proposal": True,
@@ -864,6 +872,14 @@ def _confirmed_capability_failure_reply(capability: str) -> str:
     if capability == "human_follow":
         return "跟随模式没有成功启动，我会保持原地。"
     return "这个动作没有成功启动。"
+
+
+def _suppress_user_visible_reply(result) -> bool:
+    metadata = getattr(result, "metadata", {}) or {}
+    return (
+        getattr(result, "tool", None) == "wait"
+        and metadata.get("stop_reason") == "empty_response"
+    )
 
 
 def _should_publish_skill_progress_reply(skill: SkillIntent) -> bool:

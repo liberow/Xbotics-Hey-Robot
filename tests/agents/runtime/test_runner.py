@@ -40,6 +40,61 @@ def test_agent_runtime_returns_wait_on_provider_error() -> None:
     assert result.result == "provider unavailable"
 
 
+def test_provider_timeout_after_successful_tool_returns_tool_fallback() -> None:
+    provider = FakeProvider(
+        [
+            {
+                "tool": "request_perception",
+                "args": {"question": "what do you see", "freshness": "fresh"},
+                "reason": "need fresh visual evidence",
+            },
+            ReasoningResponse(
+                content="LLM provider call timed out",
+                finish_reason="error",
+                error_kind="timeout",
+            ),
+        ]
+    )
+    runtime = AgentRuntime(provider, max_iterations=2)
+    runtime.register_tool(
+        "request_perception",
+        lambda question, freshness="fresh": json.dumps(
+            {
+                "tool": "request_perception",
+                "evidence": {
+                    "status": "ok",
+                    "summary": f"{question}: bottle on the table",
+                },
+                "freshness": freshness,
+            }
+        ),
+        read_only=True,
+        result_policy="require_final_answer",
+    )
+
+    result = asyncio.run(runtime.step(_payload("what do you see")))
+
+    assert result.tool == "final_response"
+    assert result.stop_reason == "text_response"
+    assert result.result == "what do you see: bottle on the table"
+
+
+def test_provider_timeout_without_tool_still_returns_model_timeout() -> None:
+    provider = FakeProvider(
+        ReasoningResponse(
+            content="LLM provider call timed out",
+            finish_reason="error",
+            error_kind="timeout",
+        )
+    )
+    runtime = AgentRuntime(provider, max_iterations=2)
+
+    result = asyncio.run(runtime.step(_payload()))
+
+    assert result.tool == "wait"
+    assert result.stop_reason == "model_timeout"
+
+
 def test_agent_runtime_executes_tool_then_uses_required_final_answer_policy() -> None:
     provider = FakeProvider(
         {
@@ -126,6 +181,349 @@ def test_agent_runtime_can_continue_to_second_robot_skill_after_skill_result() -
         "request_capability",
         "request_capability",
     ]
+
+
+def test_agent_runtime_blocks_motion_final_until_required_capability_runs() -> None:
+    provider = FakeProvider(
+        [
+            "我已经看了一下当前画面。",
+            {
+                "tool": "request_capability",
+                "args": {
+                    "capability": "turn_base",
+                    "objective": "向左转动底盘",
+                    "slots": {"direction": "left", "angle_deg": 15},
+                },
+                "reason": "the task requires a base turn, not only perception",
+            },
+            "已完成向左转动。",
+        ]
+    )
+    runtime = AgentRuntime(provider, max_iterations=4)
+    submitted: list[dict[str, Any]] = []
+
+    def submit_capability(
+        capability: str, objective: str, slots: dict[str, Any] | None = None
+    ) -> str:
+        submitted.append(
+            {"capability": capability, "objective": objective, "slots": slots or {}}
+        )
+        return f"{capability} completed: {objective}"
+
+    runtime.register_tool(
+        "request_capability", submit_capability, safety_level="motion"
+    )
+
+    result = asyncio.run(runtime.step(_payload("往左转")))
+
+    assert result.tool == "final_response"
+    assert result.task_finished is True
+    assert result.result == "已完成向左转动。"
+    assert [item["capability"] for item in submitted] == ["turn_base"]
+    assert provider.last_messages is not None
+    assert any(
+        "Task evidence evaluator" in str(message.content)
+        for message in provider.last_messages
+    )
+
+
+def test_agent_runtime_does_not_treat_perception_as_motion_completion() -> None:
+    provider = FakeProvider(
+        [
+            {
+                "tool": "request_capability",
+                "args": {
+                    "capability": "inspect_scene",
+                    "objective": "查看当前画面",
+                    "slots": {},
+                },
+                "reason": "check the scene first",
+            },
+            "我已经看了一下当前画面。",
+        ]
+    )
+    runtime = AgentRuntime(provider, max_iterations=2)
+
+    def submit_observation(
+        capability: str, objective: str, slots: dict[str, Any] | None = None
+    ) -> str:
+        del slots
+        return f"{capability} completed: {objective}"
+
+    runtime.register_tool(
+        "request_capability",
+        submit_observation,
+        safety_level="observe",
+    )
+
+    result = asyncio.run(runtime.step(_payload("往左转")))
+
+    assert result.tool == "wait"
+    assert result.stop_reason == "task_evidence_incomplete"
+    assert result.task_finished is False
+    assert "base_turn_action_result" in result.result
+
+
+def test_agent_runtime_does_not_treat_perception_as_forward_motion_completion() -> None:
+    provider = FakeProvider(
+        [
+            {
+                "tool": "request_capability",
+                "args": {
+                    "capability": "inspect_scene",
+                    "objective": "check the area before moving",
+                    "slots": {},
+                },
+                "reason": "look before moving",
+            },
+            "I checked the scene.",
+        ]
+    )
+    runtime = AgentRuntime(provider, max_iterations=2)
+
+    def submit_observation(
+        capability: str, objective: str, slots: dict[str, Any] | None = None
+    ) -> str:
+        del slots
+        return f"{capability} completed: {objective}"
+
+    runtime.register_tool(
+        "request_capability",
+        submit_observation,
+        safety_level="observe",
+    )
+
+    result = asyncio.run(runtime.step(_payload("move forward a little")))
+
+    assert result.tool == "wait"
+    assert result.stop_reason == "task_evidence_incomplete"
+    assert result.task_finished is False
+    assert "base_move_action_result" in result.result
+
+
+def test_agent_runtime_does_not_treat_perception_as_arm_raise_completion() -> None:
+    provider = FakeProvider(
+        [
+            {
+                "tool": "request_capability",
+                "args": {
+                    "capability": "move_arm_joints",
+                    "objective": "raise the arm endpoint",
+                    "slots": {"joints": [{"name": "shoulder_lift", "delta": 0.15}]},
+                },
+                "reason": "try arm adjustment",
+            },
+            {
+                "tool": "request_capability",
+                "args": {
+                    "capability": "inspect_scene",
+                    "objective": "check the arm endpoint",
+                    "slots": {},
+                },
+                "reason": "inspect after failure",
+            },
+            "我已经看了一下当前画面。",
+        ]
+    )
+    runtime = AgentRuntime(provider, max_iterations=3)
+
+    def submit_capability(
+        capability: str, objective: str, slots: dict[str, Any] | None = None
+    ) -> str:
+        del objective, slots
+        if capability == "move_arm_joints":
+            raise RuntimeError("arm joint command rejected")
+        return "scene inspected"
+
+    runtime.register_tool(
+        "request_capability",
+        submit_capability,
+        safety_level="motion",
+    )
+
+    result = asyncio.run(runtime.step(_payload("机械臂末端抬高一些")))
+
+    assert result.tool == "final_response"
+    assert result.stop_reason == "text_response"
+    assert result.task_finished is False
+    assert result.task_evaluation_applied is True
+
+
+def test_agent_runtime_does_not_treat_wrong_motion_capability_as_turn_completion() -> (
+    None
+):
+    provider = FakeProvider(
+        [
+            {
+                "tool": "request_capability",
+                "args": {
+                    "capability": "move_base",
+                    "objective": "move forward instead",
+                    "slots": {"direction": "forward", "distance_cm": 10},
+                },
+                "reason": "wrong motion selected",
+            },
+            "Done.",
+        ]
+    )
+    runtime = AgentRuntime(provider, max_iterations=2)
+
+    def submit_motion(
+        capability: str, objective: str, slots: dict[str, Any] | None = None
+    ) -> str:
+        del slots
+        return f"{capability} completed: {objective}"
+
+    runtime.register_tool(
+        "request_capability",
+        submit_motion,
+        safety_level="motion",
+    )
+
+    result = asyncio.run(runtime.step(_payload("turn left")))
+
+    assert result.tool == "wait"
+    assert result.stop_reason == "task_evidence_incomplete"
+    assert result.task_finished is False
+    assert "base_turn_action_result" in result.result
+
+
+def test_agent_runtime_does_not_allow_caption_to_replace_marker_detector(
+    tmp_path: Path,
+) -> None:
+    provider = FakeProvider(
+        [
+            {
+                "tool": "request_capability",
+                "args": {
+                    "capability": "inspect_scene",
+                    "objective": "look for a workspace marker",
+                    "slots": {},
+                },
+                "reason": "visual caption might show a marker",
+            },
+            "I can see a red marker-like region, so the workspace marker is confirmed.",
+        ]
+    )
+    recorder = AgentRunRecorder(tmp_path, agent_run_id="marker-caption")
+    runtime = AgentRuntime(provider, max_iterations=2, agent_run_recorder=recorder)
+
+    def submit_caption(
+        capability: str, objective: str, slots: dict[str, Any] | None = None
+    ) -> str:
+        del capability, objective, slots
+        return "caption: red marker-like region visible"
+
+    runtime.register_tool(
+        "request_capability",
+        submit_caption,
+        safety_level="observe",
+    )
+
+    result = asyncio.run(
+        runtime.step(_payload("check whether there is a workspace marker"))
+    )
+
+    assert result.tool == "wait"
+    assert result.stop_reason == "task_evidence_incomplete"
+    assert result.task_finished is False
+    assert "marker_detection_result" in result.result
+    reader = AgentRunReader(tmp_path, agent_run_id="marker-caption")
+    evaluations = reader.read_jsonl(
+        "task_evaluations.jsonl", agent_run_id="marker-caption"
+    )
+    evidence = reader.read_jsonl("task_evidence.jsonl", agent_run_id="marker-caption")
+
+    assert evaluations[-1]["evaluation"]["can_finalize"] is False
+    assert evaluations[-1]["evaluation"]["missing_evidence"] == [
+        "marker_detection_result"
+    ]
+    assert any(
+        record["evidence_type"] == "weak_scene_observation"
+        for item in evidence
+        for record in item["ledger"]["records"]
+    )
+
+
+def test_agent_runtime_allows_failed_marker_detector_final_without_goal_success() -> (
+    None
+):
+    provider = FakeProvider(
+        [
+            {
+                "tool": "request_capability",
+                "args": {
+                    "capability": "detect_marker",
+                    "objective": "detect workspace marker",
+                    "slots": {},
+                },
+                "reason": "use the dedicated detector",
+            },
+            "Marker detection failed, so I cannot confirm the workspace marker.",
+        ]
+    )
+    runtime = AgentRuntime(provider, max_iterations=2)
+
+    def request_capability(
+        capability: str, objective: str, slots: dict[str, Any] | None = None
+    ) -> str:
+        del objective, slots
+        if capability == "detect_marker":
+            raise RuntimeError("marker detector timed out")
+        return f"{capability} completed"
+
+    runtime.register_tool(
+        "request_capability",
+        request_capability,
+        safety_level="observe",
+    )
+
+    result = asyncio.run(
+        runtime.step(_payload("check whether there is a workspace marker"))
+    )
+
+    assert result.tool == "final_response"
+    assert result.stop_reason == "text_response"
+    assert result.task_finished is False
+    assert result.task_evaluation_applied is True
+    assert "cannot confirm" in result.result
+
+
+def test_agent_runtime_allows_concrete_capability_refusal_to_finish_turn() -> None:
+    provider = FakeProvider("I cannot do that.")
+    runtime = AgentRuntime(provider, max_iterations=1)
+
+    result = asyncio.run(runtime.step(_payload("move closer")))
+
+    assert result.tool == "final_response"
+    assert result.stop_reason == "text_response"
+    assert result.task_finished is False
+    assert result.task_evaluation_applied is True
+    assert result.result == "I cannot do that."
+
+
+def test_agent_runtime_caps_provider_timeout_by_turn_budget() -> None:
+    class SlowProvider:
+        async def chat(self, **kwargs: Any) -> ReasoningResponse:
+            del kwargs
+            await asyncio.sleep(1.0)
+            return ReasoningResponse(content="too late", finish_reason="stop")
+
+        def get_default_model(self) -> str:
+            return "slow-provider"
+
+    runtime = AgentRuntime(
+        SlowProvider(),
+        max_iterations=1,
+        provider_timeout_sec=300.0,
+        turn_timeout_sec=0.05,
+    )
+
+    result = asyncio.run(runtime.step(_payload("what do you see")))
+
+    assert result.tool == "wait"
+    assert result.stop_reason == "model_timeout"
+    assert "timed out" in result.result
 
 
 def test_agent_runtime_grounding_guard_inserts_perception_before_visual_answer() -> (
@@ -261,7 +659,7 @@ def test_agent_runtime_records_tool_decision_and_skill_memory_fallback(
     memory = Memory()
     runtime.memory = memory
 
-    result = asyncio.run(runtime.step(_payload()))
+    result = asyncio.run(runtime.step(_payload("close gripper")))
 
     assert result.tool == "final_response"
     assert result.stop_reason == "text_response"
@@ -283,6 +681,18 @@ def test_agent_runtime_records_tool_decision_and_skill_memory_fallback(
     assert latest is not None
     assert latest["decision"]["tool"] == "request_capability"
     assert latest["result"]["success"] is True
+    reader = AgentRunReader(tmp_path, agent_run_id="run1")
+    contracts = reader.read_jsonl("task_contracts.jsonl", agent_run_id="run1")
+    evidence = reader.read_jsonl("task_evidence.jsonl", agent_run_id="run1")
+    evaluations = reader.read_jsonl("task_evaluations.jsonl", agent_run_id="run1")
+
+    assert contracts[-1]["contract"]["required_capability"]["type"] == "gripper_control"
+    assert any(
+        record["evidence_type"] == "gripper_action_result"
+        for item in evidence
+        for record in item["ledger"]["records"]
+    )
+    assert evaluations[-1]["evaluation"]["can_finalize"] is True
 
 
 def test_agent_runtime_emits_runtime_hooks_in_expected_order() -> None:
@@ -788,6 +1198,140 @@ def test_agent_runtime_appends_continuation_guidance_after_successful_capability
     assert "- one_motion_one_perception:" in provider.last_messages[-1].content
 
 
+def test_agent_runtime_directly_completes_single_step_action_feedback() -> None:
+    provider = FakeProvider(
+        [
+            {
+                "tool": "request_capability",
+                "args": {
+                    "capability": "set_gripper",
+                    "objective": "open the gripper",
+                },
+                "reason": "open gripper",
+            },
+            "provider should not be called again",
+        ]
+    )
+    runtime = AgentRuntime(provider, max_iterations=4)
+
+    def complete_gripper(capability: str, objective: str) -> str:
+        del capability, objective
+        return (
+            "Execution feedback for skill skill1:\n"
+            "- outcome: confirmed\n"
+            "- subgoal_success: True\n"
+            "- task_success: True\n"
+            "- summary: gripper opened\n"
+            "- recommended_action: report_or_continue"
+        )
+
+    runtime.register_tool(
+        "request_capability", complete_gripper, safety_level="actuate"
+    )
+
+    result = asyncio.run(runtime.step(_payload("夹爪打开")))
+
+    assert result.tool == "final_response"
+    assert result.reason == "single_step_action_completed"
+    assert result.task_finished is True
+    assert result.result == "gripper opened"
+    assert provider.responses == ["provider should not be called again"]
+
+
+def test_agent_runtime_single_step_action_feedback_is_user_facing() -> None:
+    provider = FakeProvider(
+        [
+            {
+                "tool": "request_capability",
+                "args": {"capability": "move_base", "objective": "move forward"},
+                "reason": "move forward",
+            },
+            "provider should not be called again",
+        ]
+    )
+    runtime = AgentRuntime(provider, max_iterations=4)
+
+    def complete_move(capability: str, objective: str) -> str:
+        del capability, objective
+        return (
+            "Execution feedback for skill skill1:\n"
+            "- outcome: confirmed\n"
+            "- subgoal_success: True\n"
+            "- task_success: True\n"
+            "- summary: base moved forward 10.0cm; robot_state=observed\n"
+            "- recommended_action: report_or_continue"
+        )
+
+    runtime.register_tool("request_capability", complete_move, safety_level="actuate")
+
+    result = asyncio.run(runtime.step(_payload("往前走一些")))
+
+    assert result.tool == "final_response"
+    assert result.reason == "single_step_action_completed"
+    assert result.task_finished is True
+    assert result.result == "已经向前移动约 10 厘米。"
+    assert "robot_state" not in result.result
+    assert provider.responses == ["provider should not be called again"]
+
+
+def test_agent_runtime_attaches_compact_turn_trace() -> None:
+    provider = FakeProvider(
+        [
+            {
+                "tool": "request_perception",
+                "args": {"question": "what do you see", "freshness": "fresh"},
+                "reason": "need visual evidence",
+            },
+        ]
+    )
+    runtime = AgentRuntime(provider, max_iterations=1)
+
+    def perceive(question: str, freshness: str = "fresh") -> str:
+        del question
+        return json.dumps(
+            {
+                "tool": "request_perception",
+                "evidence": {"status": "ok", "summary": "desk ahead"},
+                "freshness": freshness,
+            }
+        )
+
+    runtime.register_tool(
+        "request_perception",
+        perceive,
+        read_only=True,
+        result_policy="require_final_answer",
+    )
+
+    result = asyncio.run(runtime.step(_payload("what do you see")))
+
+    trace = result.args["_turn_trace"]
+    assert trace["task"] == "what do you see"
+    assert trace["model_calls"][0]["finish_reason"] == "tool_calls"
+    assert trace["tool_calls"][0]["name"] == "request_perception"
+    assert trace["final"]["tool"] == "final_response"
+    assert trace["final"]["stop_reason"] == "text_response"
+
+
+def test_agent_runtime_persists_compact_turn_trace_when_recorder_is_enabled(
+    tmp_path,
+) -> None:
+    provider = FakeProvider("hello")
+    recorder = AgentRunRecorder(log_dir=tmp_path, agent_run_id="run1")
+    runtime = AgentRuntime(provider, max_iterations=1, agent_run_recorder=recorder)
+
+    result = asyncio.run(runtime.step(_payload("hello")))
+
+    traces = AgentRunReader(log_dir=tmp_path, agent_run_id="run1").read_jsonl(
+        "turn_traces.jsonl"
+    )
+
+    assert result.tool == "final_response"
+    assert traces
+    assert traces[-1]["trace"]["task"] == "hello"
+    assert traces[-1]["trace"]["final"]["stop_reason"] == "text_response"
+
+
 def test_agent_runtime_appends_recovery_guidance_after_failed_capability_step() -> None:
     provider = FakeProvider(
         [
@@ -973,7 +1517,8 @@ def test_post_tool_guidance_failed_motion_injects_inspect_guidance() -> None:
     )
     runtime = AgentRuntime(provider, max_iterations=2)
 
-    def fail_move(capability: str, _objective: str) -> str:
+    def fail_move(capability: str, objective: str) -> str:
+        del objective
         raise RuntimeError(f"{capability} failed: collision detected")
 
     runtime.register_tool("request_capability", fail_move, safety_level="actuate")
@@ -999,7 +1544,8 @@ def test_failed_capability_does_not_update_last_capability_state() -> None:
     )
     runtime = AgentRuntime(provider, max_iterations=2)
 
-    def fail_turn(capability: str, _objective: str) -> str:
+    def fail_turn(capability: str, objective: str) -> str:
+        del objective
         raise RuntimeError(f"{capability} failed: blocked")
 
     runtime.register_tool("request_capability", fail_turn, safety_level="actuate")
